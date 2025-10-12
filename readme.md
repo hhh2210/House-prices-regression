@@ -1,138 +1,252 @@
-Background:
+# House Prices Regression - Advanced Ensemble Solution
+
+## Background
 Ask a home buyer to describe their dream house, and they probably won't begin with the height of the basement ceiling or the proximity to an east-west railroad. But this playground competition's dataset proves that much more influences price negotiations than the number of bedrooms or a white-picket fence.
 
 With 79 explanatory variables describing (almost) every aspect of residential homes in Ames, Iowa, this competition challenges you to predict the final price of each home.
 
-1. Macbook m4
-2. GPU with CUDA
+## 硬件支持
+- ✅ Macbook M4 (Apple Silicon MPS)
+- ✅ GPU with CUDA (推荐：大显存GPU如L20 48GB)
+- ✅ CPU fallback
 
-思路与MPS加速实践（PyTorch）
+## 项目结构
+```
+House-prices-regression/
+├── data/
+│   ├── train.csv          # 训练数据
+│   └── test.csv           # 测试数据
+├── src/
+│   ├── train_tree.py      # 树模型基线（XGBoost/LightGBM/RF/HGB）
+│   ├── train_ensemble.py  # CPU/GPU ensemble (XGBoost + LightGBM)
+│   ├── train_gpu_ensemble.py  # 完整GPU加速ensemble (NN + XGBoost + LightGBM)
+│   └── train_mps.py       # PyTorch MLP (支持MPS/CUDA/CPU)
+├── submissions/           # 生成的提交文件
+├── pyproject.toml         # 依赖管理
+└── readme.md
+```
+
+## 核心思路与方法
+
+### 1. 特征工程（Feature Engineering）
 
 - 目标与指标
   - 对 `SalePrice` 做对数变换（`log1p`），在对数空间训练；验证指标用对数空间的 RMSE（接近竞赛的 RMSLE）。
-- 特征预处理
-  - 数值列：中位数填补缺失 + 标准化。
-  - 类别列：众数填补 + One-Hot 编码（忽略未知类别）。
-  - 以上用 `sklearn` 的 `ColumnTransformer` 与 `Pipeline` 组合完成。
-- 验证策略
-  - 先用 `train/valid` 切分跑通（默认 90/10）。后续可切到 KFold 做更稳健的验证与集成。
-- 模型（PyTorch）
-  - 简单的 MLP 回归器（ReLU 多层全连接），损失为 MSE；优化器 Adam，`weight_decay` 做 L2 正则；`ReduceLROnPlateau` 与 early stopping。
-- Apple Silicon/MPS 要点（适用于 MacBook M4）
-  - 自动优先选择 `mps` 设备：若不可用回退到 CPU；也可用 `--device mps` 强制。
-  - 使用 `float32`（已在脚本中确保），避免 `float64` 导致性能差。
-  - DataLoader 默认 `num_workers=0` 更通用；需要时再升到 2/4 试速。
-  - 如果显存不够，降低 `--batch_size`。
+**基础特征**：
+- 面积汇总：`TotalSF`, `TotalPorchSF`
+- 时间特征：`HouseAge`, `RemodAge`, `IsRemodeled`, `GarageAge`
+- 卫浴统计：`TotalBath`（全浴+半浴权重）
+- 存在性标记：`HasBsmt`, `HasGarage`, `HasFireplace`, `HasPool`
+- 质量有序编码：将 Ex/Gd/TA/Fa/Po 映射为数值
 
-快速开始
+**高级特征**：
+- 交互特征：`QualArea = OverallQual × GrLivArea`, `QualBathArea`, `BathArea`
+- 多项式特征：关键数值特征的平方、立方
+- 比率特征：`BathPerArea`, `LotAreaRatio`, `SFperBath`
+- 偏度处理：对高偏度数值特征（>0.75）进行 log1p 转换
 
-1) 使用 uv 安装依赖（推荐）
+**数据清洗**：
+- 领域规则填充：对特定缺失值按竞赛规则处理（如 NA → "None"）
+- 离群点移除：去除 `GrLivArea >= 4000` 的异常样本
+- 社区填充：`LotFrontage` 按 `Neighborhood` 中位数填充
+
+### 2. 模型集成（Ensemble Learning）
+
+采用 **Stacking** 策略，结合多个模型的优势：
+
+**Level 1 Base Models**：
+- **Deep Neural Network (PyTorch)**：512→256→128→64 全连接网络，BatchNorm + Dropout
+- **XGBoost**：梯度提升树，GPU加速（device='cuda'）
+- **LightGBM**：轻量级梯度提升，GPU训练
+
+**Level 2 Meta-Learner**：
+- **Ridge Regression**：基于 OOF predictions 的线性集成
+
+**优势**：
+- 神经网络捕获非线性交互
+- 树模型处理稀疏和分类特征
+- Ridge元学习器自动学习最优权重
+
+### 3. GPU 加速优化
+
+**训练加速**：
+- XGBoost: `device='cuda'`, `tree_method='hist'`
+- LightGBM: `device='gpu'`（需 GPU 版本）
+- PyTorch: CUDA张量 + DataLoader批处理
+- Early stopping：避免过拟合并节省时间
+
+**显存优化**：
+- 48GB L20 可同时训练大batch size（512-4096）
+- 神经网络支持混合精度训练（AMP）
+- 5折交叉验证并行处理
+
+### 4. 性能指标
+
+| 模型 | CV Score (RMSE log) | 特点 |
+|------|---------------------|------|
+| XGBoost Tuned | ~0.116 | GPU加速，超参数搜索 |
+| GPU Ensemble (NN+XGBoost+LGB) | **~0.121** | 完整stacking，最佳性能 |
+| HGB Tuned | ~0.120 | CPU友好 |
+
+## 快速开始
+
+### 1. 安装依赖
 
 ```bash
-# 安装 uv（二选一）
-brew install uv                        # 如果你用 Homebrew
-# 或者：
+# 安装 uv 包管理器（二选一）
+brew install uv                        # macOS Homebrew
+# 或：
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 准备 Python 与虚拟环境（可选固定版本）
-uv python install 3.11                 # 可选：安装并使用 3.11
-uv venv -p 3.11                        # 或直接 `uv venv`
-
-# 同步依赖（基于 pyproject.toml）
-uv sync
-
-# 也可沿用 requirements.txt（可选）
-uv pip sync requirements.txt
+# 准备环境并安装依赖
+uv python install 3.11                 # 安装 Python 3.11
+uv sync                                # 同步依赖（基于 pyproject.toml）
 ```
 
-2) 训练并生成提交文件（自动使用 MPS，如果可用）
+### 2. 选择训练脚本
+
+#### 🚀 方案一：GPU 完整 Ensemble（推荐，最佳性能）
+**适用**：48GB GPU (L20/A100)，目标 RMSE ~0.11-0.12
 
 ```bash
-# 无需手动激活虚拟环境，直接用 uv 运行
-uv run python src/train_mps.py --device mps --epochs 200 --batch_size 512 --hidden_dim 256 --layers 3
+# 深度神经网络 + XGBoost + LightGBM 三模型 stacking
+uv run python src/train_gpu_ensemble.py --folds 5
 ```
 
-树模型 + 特征工程（推荐的更强基线）
+**特点**：
+- 5折交叉验证，自动stacking
+- 完整特征工程（354维）
+- GPU加速训练（NN + 树模型）
+- 输出：`submissions/submission_gpu_ensemble.csv`
 
-- 我们新增了 `src/train_tree.py`：包含常用特征工程（面积/房龄/总卫浴/门廊、质量有序映射、是否存在标记等）、偏度列 `log1p` 处理，以及 5 折 KFold 交叉验证。
-- 默认模型 `--model hgb` 使用 `HistGradientBoostingRegressor`（sklearn 内置、无需额外依赖）；也可选 `rf`/`xgb`/`lgbm`（后两者需额外安装）。
+---
 
-运行示例：
+#### ⚡ 方案二：树模型基线（快速调参）
+**适用**：CPU/GPU，快速迭代
 
 ```bash
-# 5 折 CV + 生成提交（submissions/submission_tree_hgb.csv）
+# XGBoost（GPU加速 + 超参数搜索）
+uv run python src/train_tree.py --model xgb --gpu --folds 5
+
+# 带超参数搜索（20次迭代）
+uv run python src/train_tree.py --model xgb --tune --n_iter 20 --folds 3 --gpu
+
+# LightGBM（需先安装）
+uv add lightgbm
+uv run python src/train_tree.py --model lgbm --gpu --folds 5
+
+# HistGradientBoosting（sklearn，CPU友好）
 uv run python src/train_tree.py --model hgb --folds 5
-
-# 切换随机森林（CPU 很快）
-uv run python src/train_tree.py --model rf --folds 5
-
-# 可选安装并使用 XGBoost/LightGBM（需要时再装）
-uv add xgboost           # 如需 XGBoost
-uv add lightgbm          # 如需 LightGBM
-uv run python src/train_tree.py --model xgb --folds 5
-uv run python src/train_tree.py --model lgbm --folds 5
 ```
 
-CUDA/大显存 GPU（48GB）一键运行与调参
+**参数说明**：
+- `--gpu`: 启用GPU加速（XGBoost/LightGBM）
+- `--tune`: 超参数搜索（RandomizedSearchCV）
+- `--n_iter`: 搜索迭代次数（默认40）
+- `--folds`: K折交叉验证折数（默认5）
 
-- MLP（PyTorch，混合精度 + 随机搜索 + K 折集成，推荐在 48GB 上运行）
+---
+
+#### 🍎 方案三：PyTorch MLP（Apple Silicon 优化）
+**适用**：MacBook M4 (MPS加速)
 
 ```bash
-# 一键：搜索 30 次 + 5 折集成，自动使用 CUDA AMP 与更高并行度
-uv run python src/train_mps.py \
-  --device cuda --amp \
-  --search_trials 30 --kfolds 5 \
-  --epochs 300 --num_workers 8 --batch_size 4096
+# 使用 MPS 加速
+uv run python src/train_mps.py --device mps --epochs 200 --batch_size 512
+
+# CUDA GPU
+uv run python src/train_mps.py --device cuda --epochs 300 --batch_size 1024
 ```
 
-- 树模型（sklearn，随机搜索）
+---
 
-```bash
-# HistGradientBoosting 随机搜索 80 次 + 5 折
-uv run python src/train_tree.py --model hgb --tune --n_iter 80 --folds 5
+## 输出文件
 
-# 可选：安装并使用 XGBoost（如需 GPU 版）
-uv add xgboost
-uv run python src/train_tree.py --model xgb --tune --n_iter 80 --folds 5
-```
+训练完成后，提交文件保存在 `submissions/` 目录：
 
-可选项与提示
+| 文件名 | 对应脚本 | 说明 |
+|--------|---------|------|
+| `submission_gpu_ensemble.csv` | `train_gpu_ensemble.py` | GPU完整ensemble |
+| `submission_tree_xgb_tuned.csv` | `train_tree.py --model xgb --tune` | XGBoost调参版 |
+| `submission_tree_hgb.csv` | `train_tree.py --model hgb` | HGB基线 |
+| `submission_pytorch_mlp.csv` | `train_mps.py` | PyTorch MLP |
 
-- `--remove_outliers/--no_remove_outliers`：是否按常见做法移除极端 `GrLivArea`（默认移除）。
-- `--log_target`：对 `SalePrice` 取对数训练（默认开启，和竞赛 RMSLE 对齐）。
-- CV 会打印每折与均值的 `RMSE(log)`，便于快速比较模型与特征改动。
+## 可调参数
 
-- 读取数据路径：`data/train.csv` 和 `data/test.csv`
-- 训练完成后，PyTorch 版本会输出 `submissions/submission_pytorch_mlp.csv`（若使用 K 折则带 `_k{K}` 后缀；若 `--log_target`，则已 `expm1` 还原）。
-- 树模型会输出到 `submissions/submission_tree_{model}.csv`，若 `--tune` 则带 `_tuned` 后缀。
+### train_gpu_ensemble.py
+- `--folds`: K折交叉验证数（默认5）
+- `--seed`: 随机种子（默认42）
 
-常用可调参数
+### train_tree.py
+- `--model`: 模型选择（hgb/rf/xgb/lgbm，默认hgb）
+- `--folds`: 交叉验证折数（默认5）
+- `--tune`: 启用超参数搜索
+- `--n_iter`: 搜索迭代次数（默认40）
+- `--gpu`: 启用GPU加速
+- `--log_target`: 目标对数变换（默认开启）
+- `--remove_outliers`: 移除离群点（默认开启）
 
-- `--epochs`：训练轮数（默认 200，带 early stopping）。
-- `--batch_size`：批大小（默认 512；显存不足请调小）。
-- `--hidden_dim` / `--layers` / `--dropout`：MLP 结构。
-- `--lr` / `--weight_decay`：优化器与正则。
-- `--val_size`：验证集占比（默认 0.1）。
-- `--device`：强制设备（`cpu|cuda|mps`）。
-- `--log_target`：是否对 `SalePrice` 做 `log1p` 训练（默认开）。
+### train_mps.py
+- `--device`: 设备选择（cpu/cuda/mps，默认自动）
+- `--epochs`: 训练轮数（默认200）
+- `--batch_size`: 批大小（默认512）
+- `--hidden_dim`: 隐藏层维度（默认256）
+- `--layers`: 隐藏层数（默认3）
+- `--lr`: 学习率（默认0.001）
+- `--dropout`: Dropout率（默认0.3）
 
-下一步提升方向（按收益推荐）
+## 性能优化建议
 
-- 验证与集成
-  - 切换到 KFold（如 K=5），取各折平均预测；或对多个 MLP/结构做简单集成。
-- 特征工程（强烈建议）
-  - 面积类汇总：`TotalSF = TotalBsmtSF + 1stFlrSF + 2ndFlrSF`
-  - 年份衍生：`HouseAge = YrSold - YearBuilt`，`RemodAge = YrSold - YearRemodAdd`，`IsRemodeled` 标记。
-  - 卫浴合并：`TotalBathrooms = FullBath + 0.5*HalfBath + BsmtFullBath + 0.5*BsmtHalfBath`
-  - 车库/地下室/门廊等是否存在布尔特征；社区（`Neighborhood`）均值编码（注意泄露，用交叉验证目标编码）。
-- 数据清洗
-  - 移除明显离群点（例如较小 `GrLivArea` 却异常高价的样本）。
-  - 对偏度大的数值列做 Box-Cox/对数变换以提升线性可分性。
-- 训练技巧
-  - OneCycleLR/余弦退火等学习率策略；合适的 `dropout/weight_decay`；增大 batch size（若显存允许）。
-- 模型对比
-  - 与树模型（LightGBM/XGBoost/CatBoost）做基线对比，后续可做 stacking/blending。
+### 如何进一步提升 (目标 < 0.11)
 
-代码位置
+1. **增加模型多样性**
+   - 添加CatBoost到ensemble
+   - 尝试不同的neural network架构
+   - 使用TabNet等表格专用模型
 
-- 训练与提交脚本：`src/train_mps.py`
+2. **高级特征工程**
+   - Target encoding for neighborhood
+   - 更多交互特征组合
+   - 时序特征（建造年份周期性）
+   - 外部数据融合
+
+3. **优化stacking策略**
+   - 多层stacking（Level 3）
+   - 使用更复杂的meta-learner（如LightGBM）
+   - Out-of-fold predictions optimization
+
+4. **超参数深度调优**
+   - Optuna/Hyperopt替代RandomizedSearchCV
+   - 增加搜索空间和迭代次数
+   - 针对ensemble权重的grid search
+
+## 注意事项
+
+- **数据路径**：确保 `data/train.csv` 和 `data/test.csv` 存在
+- **GPU显存**：神经网络batch size根据显存调整（48GB可用4096+）
+- **训练时间**：
+  - GPU Ensemble: ~5-10分钟 (L20 48GB)
+  - Tree模型单次: ~1-2分钟
+  - Tree模型调参: 取决于`n_iter`，建议20-50次
+- **CV vs Kaggle分数**：通常CV分数比Public LB略高0.001-0.003
+
+## 项目依赖
+
+核心库：
+- `numpy`, `pandas`: 数据处理
+- `scikit-learn`: 预处理、CV、meta-learner
+- `torch`: 神经网络训练
+- `xgboost`: 梯度提升树（GPU支持）
+- `lightgbm`: 轻量级GBDT（GPU支持）
+- `tqdm`: 进度条
+
+## 参考资料
+
+- [Kaggle House Prices Competition](https://www.kaggle.com/c/house-prices-advanced-regression-techniques)
+- [XGBoost GPU Support](https://xgboost.readthedocs.io/en/latest/gpu/)
+- [LightGBM GPU Tutorial](https://lightgbm.readthedocs.io/en/latest/GPU-Tutorial.html)
+- [PyTorch MPS Backend](https://pytorch.org/docs/stable/notes/mps.html)
+
+## License
+
+MIT

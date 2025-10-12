@@ -2,9 +2,13 @@ import argparse
 import inspect
 from pathlib import Path
 from typing import Tuple, List
+import warnings
+import threading
+import time
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from sklearn.model_selection import KFold, RandomizedSearchCV
 from sklearn.metrics import mean_squared_error
@@ -13,6 +17,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
+
+warnings.filterwarnings('ignore', category=UserWarning, module='xgboost')
 
 
 def set_seed(seed: int = 42):
@@ -294,7 +300,7 @@ def apply_domain_na_rules(
     return df, neighborhood_lf_median, global_lf_median
 
 
-def get_model(kind: str, seed: int, use_gpu: bool = False):
+def get_model(kind: str, seed: int, use_gpu: bool = False, enable_early_stopping: bool = False):
     kind = kind.lower()
     if kind == "rf":
         return RandomForestRegressor(
@@ -323,19 +329,18 @@ def get_model(kind: str, seed: int, use_gpu: bool = False):
                 colsample_bytree=0.8,
                 reg_lambda=1.0,
                 random_state=seed,
+                verbosity=0,
             )
+            if enable_early_stopping:
+                params.update(dict(
+                    early_stopping_rounds=50,
+                    eval_metric="rmse",
+                ))
             if use_gpu:
-                params.update(dict(tree_method="gpu_hist", predictor="gpu_predictor", gpu_id=0))
+                params.update(dict(device="cuda", tree_method="hist"))
             else:
-                params.update(dict(tree_method="hist"))
-            try:
-                return XGBRegressor(**params)
-            except Exception:
-                # Safe fallback to CPU hist if GPU params not supported
-                params.update(dict(tree_method="hist"))
-                params.pop("predictor", None)
-                params.pop("gpu_id", None)
-                return XGBRegressor(**params)
+                params.update(dict(device="cpu", tree_method="hist"))
+            return XGBRegressor(**params)
         except Exception as e:
             raise RuntimeError(
                 "xgboost is not installed. Install with `uv add xgboost` or use --model hgb/rf."
@@ -352,6 +357,7 @@ def get_model(kind: str, seed: int, use_gpu: bool = False):
                 colsample_bytree=0.8,
                 reg_lambda=1.0,
                 random_state=seed,
+                verbosity=-1,
             )
             if use_gpu:
                 # Try different aliases depending on LightGBM build
@@ -436,7 +442,12 @@ def main():
     pre, num_cols, cat_cols = build_preprocessor(X_df)
 
     if args.tune:
-        print("Running RandomizedSearchCV for hyperparameter tuning...")
+        total_fits = args.n_iter * args.folds
+        print(f"\n{'='*60}")
+        print(f"RandomizedSearchCV: {args.n_iter} iterations × {args.folds} folds")
+        print(f"Total fits: {total_fits}")
+        print(f"{'='*60}\n")
+        
         base_model = get_model(args.model, args.seed, use_gpu=args.gpu)
         pipe = Pipeline(steps=[("pre", pre), ("model", base_model)])
         kf = KFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
@@ -481,23 +492,55 @@ def main():
             }
             scoring = "neg_mean_squared_error"
 
+        # Use n_jobs=1 when GPU is enabled to avoid conflicts
+        n_jobs = 1 if args.gpu else -1
         search = RandomizedSearchCV(
             estimator=pipe,
             param_distributions=param_dist,
             n_iter=int(args.n_iter),
             scoring=scoring,
             cv=kf,
-            n_jobs=-1,
-            verbose=1,
+            n_jobs=n_jobs,
+            verbose=0,  # Suppress sklearn's verbose output
             random_state=args.seed,
         )
-        search.fit(X_df, y)
+        
+        # Fit with tqdm progress bar
+        pbar = tqdm(total=total_fits, desc="Hyperparameter Search", unit="fit", ncols=80)
+        
+        def monitor_cv_results():
+            """Monitor and update progress based on completed fits"""
+            prev_count = 0
+            while not getattr(threading.current_thread(), 'stop_monitoring', False):
+                if hasattr(search, 'cv_results_') and search.cv_results_ is not None:
+                    current_count = len(search.cv_results_['mean_test_score'])
+                    if current_count > prev_count:
+                        pbar.update(current_count - prev_count)
+                        prev_count = current_count
+                time.sleep(0.5)
+        
+        monitor_thread = threading.Thread(target=monitor_cv_results, daemon=True)
+        monitor_thread.start()
+        
+        try:
+            search.fit(X_df, y)
+            pbar.update(total_fits - pbar.n)  # Complete the bar
+        finally:
+            monitor_thread.stop_monitoring = True
+            monitor_thread.join(timeout=1)
+            pbar.close()
         best_rmse_log = float(np.sqrt(-search.best_score_))
-        print(f"Best CV RMSE(log): {best_rmse_log:.6f}")
+        print(f"\nBest CV RMSE(log): {best_rmse_log:.6f}")
         print(f"Best params: {search.best_params_}")
 
         final_pipe = search.best_estimator_
-        final_pipe.fit(X_df, y)
+        if args.model == "xgb":
+            # For final training, fit with eval_set for early stopping
+            final_pipe.named_steps['pre'].fit(X_df)
+            X_transformed = final_pipe.named_steps['pre'].transform(X_df)
+            final_pipe.named_steps['model'].fit(X_transformed, y, eval_set=[(X_transformed, y)], verbose=False)
+        else:
+            final_pipe.fit(X_df, y)
         test_pred_log = final_pipe.predict(X_test_df)
         preds = np.expm1(test_pred_log) if args.log_target else test_pred_log
     else:
@@ -506,14 +549,24 @@ def main():
         oof = np.zeros(X_df.shape[0], dtype=np.float64)
         scores: List[float] = []
 
-        for fold, (tr_idx, va_idx) in enumerate(kf.split(X_df), start=1):
+        print(f"\nRunning {args.folds}-fold cross-validation...")
+        for fold, (tr_idx, va_idx) in enumerate(tqdm(list(kf.split(X_df)), desc="CV Folds", ncols=80), start=1):
             X_tr = X_df.iloc[tr_idx]
             y_tr = y[tr_idx]
             X_va = X_df.iloc[va_idx]
             y_va = y[va_idx]
 
-            pipe = Pipeline(steps=[("pre", pre), ("model", get_model(args.model, args.seed, use_gpu=args.gpu))])
-            pipe.fit(X_tr, y_tr)
+            model = get_model(args.model, args.seed, use_gpu=args.gpu, enable_early_stopping=(args.model == "xgb"))
+            pipe = Pipeline(steps=[("pre", pre), ("model", model)])
+            
+            if args.model == "xgb":
+                # Use early stopping for XGBoost
+                pipe.named_steps['pre'].fit(X_tr)
+                X_tr_transformed = pipe.named_steps['pre'].transform(X_tr)
+                X_va_transformed = pipe.named_steps['pre'].transform(X_va)
+                pipe.named_steps['model'].fit(X_tr_transformed, y_tr, eval_set=[(X_va_transformed, y_va)], verbose=False)
+            else:
+                pipe.fit(X_tr, y_tr)
 
             pred_va = pipe.predict(X_va)
             oof[va_idx] = pred_va
@@ -522,11 +575,18 @@ def main():
             print(f"Fold {fold}: RMSE(log)={score:.6f}")
 
         cv_score = float(np.mean(scores))
-        print(f"CV mean RMSE(log): {cv_score:.6f}")
+        print(f"\nCV mean RMSE(log): {cv_score:.6f}")
 
         # Fit on full data and predict test
-        final_pipe = Pipeline(steps=[("pre", pre), ("model", get_model(args.model, args.seed))])
-        final_pipe.fit(X_df, y)
+        print("\nTraining final model on full dataset...")
+        final_model = get_model(args.model, args.seed, use_gpu=args.gpu, enable_early_stopping=(args.model == "xgb"))
+        final_pipe = Pipeline(steps=[("pre", pre), ("model", final_model)])
+        if args.model == "xgb":
+            final_pipe.named_steps['pre'].fit(X_df)
+            X_transformed = final_pipe.named_steps['pre'].transform(X_df)
+            final_pipe.named_steps['model'].fit(X_transformed, y, eval_set=[(X_transformed, y)], verbose=False)
+        else:
+            final_pipe.fit(X_df, y)
         test_pred_log = final_pipe.predict(X_test_df)
         preds = np.expm1(test_pred_log) if args.log_target else test_pred_log
 
