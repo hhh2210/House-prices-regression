@@ -1,0 +1,15 @@
+[project]
+name = "house-prices-regression"
+version = "0.1.0"
+description = "Kaggle House Prices regression – PyTorch MPS baseline"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "pandas",
+  "scikit-learn",
+  "torch",
+]
+
+# Not building a package here; this file exists to let `uv sync`
+# manage dependencies cleanly. No build-system required for that use.
+
