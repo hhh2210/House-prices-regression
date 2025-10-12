@@ -15,7 +15,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 
 
 def set_seed(seed: int = 42):
@@ -136,12 +136,21 @@ def train(
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     patience: int = 20,
+    amp: bool = False,
 ):
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    try:
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=lr, weight_decay=weight_decay, fused=(device.type == "cuda")
+        )
+    except TypeError:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=max(patience // 2, 2)
     )
     criterion = nn.MSELoss()
+
+    use_amp = bool(amp and device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     best_val = float("inf")
     best_state = None
@@ -152,13 +161,21 @@ def train(
         running = 0.0
         count = 0
         for X, y in train_loader:
-            X = X.to(device)
-            y = y.to(device)
+            X = X.to(device, non_blocking=(device.type == "cuda"))
+            y = y.to(device, non_blocking=(device.type == "cuda"))
             optimizer.zero_grad(set_to_none=True)
-            pred = model(X)
-            loss = criterion(pred, y)
-            loss.backward()
-            optimizer.step()
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    pred = model(X)
+                    loss = criterion(pred, y)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                pred = model(X)
+                loss = criterion(pred, y)
+                loss.backward()
+                optimizer.step()
             running += loss.item() * X.size(0)
             count += X.size(0)
         train_mse = running / max(count, 1)
@@ -187,7 +204,7 @@ def train(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="House Prices - PyTorch MPS baseline")
+    parser = argparse.ArgumentParser(description="House Prices - PyTorch MLP with CUDA/MPS and tuning")
     parser.add_argument("--data_dir", type=str, default="data", help="Path to data dir with train/test.csv")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=512)
@@ -201,10 +218,27 @@ def main():
     parser.add_argument("--device", type=str, default=None, help="Force device: cpu|cuda|mps")
     parser.add_argument("--log_target", action="store_true", help="Model log1p(SalePrice) (recommended)")
     parser.add_argument("--no_log_target", dest="log_target", action="store_false")
+    parser.add_argument("--amp", action="store_true", help="Enable AMP (mixed precision) on CUDA")
+    parser.add_argument("--no_amp", dest="amp", action="store_false")
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--kfolds", type=int, default=0, help="If >1, run K-Fold CV and average test predictions")
+    parser.add_argument("--search_trials", type=int, default=0, help="If >0, run random hyperparam search for given trials")
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile where available (CUDA/CPU). MPS will ignore.")
+    parser.add_argument(
+        "--preload_to_device",
+        action="store_true",
+        help="Preload full tensors to device memory (set num_workers=0 automatically). Suitable for small tabular data.",
+    )
     parser.set_defaults(log_target=True)
+    parser.set_defaults(amp=True)
     args = parser.parse_args()
 
     set_seed(args.seed)
+    # Improve matmul speed on Ampere+ GPUs
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
     device = get_device(args.device)
     print(f"Using device: {device}")
 
@@ -225,50 +259,194 @@ def main():
     X_all = preprocessor.fit_transform(df_train.drop(columns=[target_col]))
     X_all = X_all.astype(np.float32)
 
+    # Train/val split for tuning or single-run
     X_train, X_val, y_train, y_val = train_test_split(
         X_all, y, test_size=args.val_size, random_state=args.seed
     )
 
-    train_ds = TabularDataset(X_train, y_train)
-    val_ds = TabularDataset(X_val, y_val)
+    def make_loader(X, y=None, batch_size=1024, shuffle=False):
+        ds = TabularDataset(X, y)
+        if args.preload_to_device:
+            ds.X = ds.X.to(device)
+            if ds.y is not None:
+                ds.y = ds.y.to(device)
+            nw = 0
+            pin = False
+            persist = False
+        else:
+            nw = max(0, int(args.num_workers))
+            pin = (device.type == "cuda")
+            persist = (nw > 0)
+        return DataLoader(
+            ds, batch_size=batch_size, shuffle=shuffle, num_workers=nw, pin_memory=pin, persistent_workers=persist
+        )
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    best_cfg = {
+        "hidden_dim": args.hidden_dim,
+        "layers": args.layers,
+        "dropout": args.dropout,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "batch_size": args.batch_size,
+    }
 
-    in_dim = X_all.shape[1]
-    model = MLP(in_dim, hidden_dim=args.hidden_dim, layers=args.layers, dropout=args.dropout).to(device)
+    # Random search over hyperparameters
+    if args.search_trials and args.search_trials > 0:
+        print(f"Running random search for {args.search_trials} trials...")
+        rng = np.random.default_rng(args.seed)
+        search_space = {
+            "hidden_dim": [128, 256, 512, 768, 1024],
+            "layers": [2, 3, 4, 5],
+            "dropout": [0.0, 0.1, 0.2, 0.3, 0.5],
+            "lr": [1e-4, 2e-4, 3e-4, 5e-4, 8e-4, 1e-3, 2e-3],
+            "weight_decay": [0.0, 5e-5, 1e-4, 3e-4, 1e-3],
+            "batch_size": [512, 1024, 2048, 4096, 8192],
+        }
+        best_rmse = float("inf")
+        for t in range(1, args.search_trials + 1):
+            cfg = {k: rng.choice(v).item() if isinstance(rng.choice(v), np.generic) else rng.choice(v) for k, v in search_space.items()}
+            in_dim = X_all.shape[1]
+            model = MLP(in_dim, hidden_dim=int(cfg["hidden_dim"]), layers=int(cfg["layers"]), dropout=float(cfg["dropout"]))
+            model = model.to(device)
+            if args.compile and hasattr(torch, "compile") and device.type != "mps":
+                try:
+                    model = torch.compile(model)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            train_loader = make_loader(X_train, y_train, batch_size=int(cfg["batch_size"]), shuffle=True)
+            val_loader = make_loader(X_val, y_val, batch_size=int(cfg["batch_size"]), shuffle=False)
+            train(
+                model,
+                train_loader,
+                val_loader,
+                device,
+                epochs=args.epochs,
+                lr=float(cfg["lr"]),
+                weight_decay=float(cfg["weight_decay"]),
+                patience=max(10, int(args.epochs * 0.15)),
+                amp=args.amp,
+            )
+            _, rmse = evaluate(model, val_loader, device)
+            print(f"Trial {t:03d}: cfg={cfg} | val RMSE(log)={rmse:.6f}")
+            if rmse < best_rmse - 1e-7:
+                best_rmse = rmse
+                best_cfg = cfg
+        print(f"Best cfg: {best_cfg} | val RMSE(log)={best_rmse:.6f}")
 
-    train(
-        model,
-        train_loader,
-        val_loader,
-        device,
-        epochs=args.epochs,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        patience=max(10, int(args.epochs * 0.15)),
-    )
+    # K-Fold CV training and test-time ensembling
+    if args.kfolds and args.kfolds > 1:
+        print(f"Running {args.kfolds}-Fold CV with best config: {best_cfg}")
+        kf = KFold(n_splits=int(args.kfolds), shuffle=True, random_state=args.seed)
+        val_rmse_list: list[float] = []
+        X_test = preprocessor.transform(df_test).astype(np.float32)
+        test_ds = TabularDataset(X_test, None)
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=int(best_cfg["batch_size"]),
+            shuffle=False,
+            num_workers=max(0, int(args.num_workers)),
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=(args.num_workers > 0),
+        )
+        test_preds = []
 
-    # Predict on test and write submission
-    X_test = preprocessor.transform(df_test).astype(np.float32)
-    test_ds = TabularDataset(X_test, None)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+        for fold, (tr_idx, va_idx) in enumerate(kf.split(X_all), start=1):
+            X_tr, y_tr = X_all[tr_idx], y[tr_idx]
+            X_va, y_va = X_all[va_idx], y[va_idx]
+            train_loader = make_loader(X_tr, y_tr, batch_size=int(best_cfg["batch_size"]), shuffle=True)
+            val_loader = make_loader(X_va, y_va, batch_size=int(best_cfg["batch_size"]), shuffle=False)
 
-    model.eval()
-    preds = []
-    with torch.no_grad():
-        for X in test_loader:
-            X = X.to(device)
-            p = model(X).squeeze(1).detach().cpu().numpy()
-            preds.append(p)
-    preds = np.concatenate(preds, axis=0)
+            in_dim = X_all.shape[1]
+            model = MLP(in_dim, hidden_dim=int(best_cfg["hidden_dim"]), layers=int(best_cfg["layers"]), dropout=float(best_cfg["dropout"]))
+            model = model.to(device)
+            if args.compile and hasattr(torch, "compile") and device.type != "mps":
+                try:
+                    model = torch.compile(model)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            train(
+                model,
+                train_loader,
+                val_loader,
+                device,
+                epochs=args.epochs,
+                lr=float(best_cfg["lr"]),
+                weight_decay=float(best_cfg["weight_decay"]),
+                patience=max(10, int(args.epochs * 0.15)),
+                amp=args.amp,
+            )
+            _, fold_rmse = evaluate(model, val_loader, device)
+            val_rmse_list.append(fold_rmse)
+
+            # Predict test for this fold
+            model.eval()
+            fold_pred = []
+            with torch.no_grad():
+            for Xb in test_loader:
+                Xb = Xb.to(device, non_blocking=(device.type == "cuda"))
+                    pb = model(Xb).squeeze(1).detach().cpu().numpy()
+                    fold_pred.append(pb)
+            fold_pred = np.concatenate(fold_pred, axis=0)
+            test_preds.append(fold_pred)
+            print(f"Fold {fold}: val RMSE(log)={fold_rmse:.6f}")
+
+        mean_rmse = float(np.mean(val_rmse_list))
+        print(f"CV mean RMSE(log): {mean_rmse:.6f}")
+        preds = np.mean(np.stack(test_preds, axis=0), axis=0)
+    else:
+        # Single training run with best config (either default or searched)
+        train_loader = make_loader(X_train, y_train, batch_size=int(best_cfg["batch_size"]), shuffle=True)
+        val_loader = make_loader(X_val, y_val, batch_size=int(best_cfg["batch_size"]), shuffle=False)
+
+        in_dim = X_all.shape[1]
+        model = MLP(in_dim, hidden_dim=int(best_cfg["hidden_dim"]), layers=int(best_cfg["layers"]), dropout=float(best_cfg["dropout"]))
+        model = model.to(device)
+        if args.compile and hasattr(torch, "compile") and device.type != "mps":
+            try:
+                model = torch.compile(model)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+        train(
+            model,
+            train_loader,
+            val_loader,
+            device,
+            epochs=args.epochs,
+            lr=float(best_cfg["lr"]),
+            weight_decay=float(best_cfg["weight_decay"]),
+            patience=max(10, int(args.epochs * 0.15)),
+            amp=args.amp,
+        )
+
+        X_test = preprocessor.transform(df_test).astype(np.float32)
+        test_ds = TabularDataset(X_test, None)
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=int(best_cfg["batch_size"]),
+            shuffle=False,
+            num_workers=max(0, int(args.num_workers)),
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=(args.num_workers > 0),
+        )
+        model.eval()
+        preds = []
+        with torch.no_grad():
+            for X in test_loader:
+                X = X.to(device, non_blocking=(device.type == "cuda"))
+                p = model(X).squeeze(1).detach().cpu().numpy()
+                preds.append(p)
+        preds = np.concatenate(preds, axis=0)
+
     if args.log_target:
         preds = np.expm1(preds)
 
     sub = pd.DataFrame({"Id": df_test["Id"], "SalePrice": preds})
     out_dir = Path("submissions")
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "submission_pytorch_mps.csv"
+    # Name reflects whether CV was used
+    suffix = f"_k{int(args.kfolds)}" if args.kfolds and args.kfolds > 1 else ""
+    out_path = out_dir / f"submission_pytorch_mlp{suffix}.csv"
     sub.to_csv(out_path, index=False)
     print(f"Saved submission to {out_path}")
 

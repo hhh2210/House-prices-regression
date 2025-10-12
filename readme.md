@@ -3,7 +3,8 @@ Ask a home buyer to describe their dream house, and they probably won't begin wi
 
 With 79 explanatory variables describing (almost) every aspect of residential homes in Ames, Iowa, this competition challenges you to predict the final price of each home.
 
-Macbook m4
+1. Macbook m4
+2. GPU with CUDA
 
 思路与MPS加速实践（PyTorch）
 
@@ -72,6 +73,29 @@ uv run python src/train_tree.py --model xgb --folds 5
 uv run python src/train_tree.py --model lgbm --folds 5
 ```
 
+CUDA/大显存 GPU（48GB）一键运行与调参
+
+- MLP（PyTorch，混合精度 + 随机搜索 + K 折集成，推荐在 48GB 上运行）
+
+```bash
+# 一键：搜索 30 次 + 5 折集成，自动使用 CUDA AMP 与更高并行度
+uv run python src/train_mps.py \
+  --device cuda --amp \
+  --search_trials 30 --kfolds 5 \
+  --epochs 300 --num_workers 8 --batch_size 4096
+```
+
+- 树模型（sklearn，随机搜索）
+
+```bash
+# HistGradientBoosting 随机搜索 80 次 + 5 折
+uv run python src/train_tree.py --model hgb --tune --n_iter 80 --folds 5
+
+# 可选：安装并使用 XGBoost（如需 GPU 版）
+uv add xgboost
+uv run python src/train_tree.py --model xgb --tune --n_iter 80 --folds 5
+```
+
 可选项与提示
 
 - `--remove_outliers/--no_remove_outliers`：是否按常见做法移除极端 `GrLivArea`（默认移除）。
@@ -79,7 +103,8 @@ uv run python src/train_tree.py --model lgbm --folds 5
 - CV 会打印每折与均值的 `RMSE(log)`，便于快速比较模型与特征改动。
 
 - 读取数据路径：`data/train.csv` 和 `data/test.csv`
-- 训练完成后，会在 `submissions/submission_pytorch_mps.csv` 写出预测结果（若 `--log_target`，则已 `expm1` 还原）。
+- 训练完成后，PyTorch 版本会输出 `submissions/submission_pytorch_mlp.csv`（若使用 K 折则带 `_k{K}` 后缀；若 `--log_target`，则已 `expm1` 还原）。
+- 树模型会输出到 `submissions/submission_tree_{model}.csv`，若 `--tune` 则带 `_tuned` 后缀。
 
 常用可调参数
 

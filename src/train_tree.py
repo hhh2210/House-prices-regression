@@ -6,7 +6,7 @@ from typing import Tuple, List
 import numpy as np
 import pandas as pd
 
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, RandomizedSearchCV
 from sklearn.metrics import mean_squared_error
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -294,7 +294,7 @@ def apply_domain_na_rules(
     return df, neighborhood_lf_median, global_lf_median
 
 
-def get_model(kind: str, seed: int):
+def get_model(kind: str, seed: int, use_gpu: bool = False):
     kind = kind.lower()
     if kind == "rf":
         return RandomForestRegressor(
@@ -315,8 +315,7 @@ def get_model(kind: str, seed: int):
     if kind == "xgb":
         try:
             from xgboost import XGBRegressor
-
-            return XGBRegressor(
+            params = dict(
                 n_estimators=1000,
                 learning_rate=0.05,
                 max_depth=6,
@@ -324,8 +323,19 @@ def get_model(kind: str, seed: int):
                 colsample_bytree=0.8,
                 reg_lambda=1.0,
                 random_state=seed,
-                tree_method="hist",
             )
+            if use_gpu:
+                params.update(dict(tree_method="gpu_hist", predictor="gpu_predictor", gpu_id=0))
+            else:
+                params.update(dict(tree_method="hist"))
+            try:
+                return XGBRegressor(**params)
+            except Exception:
+                # Safe fallback to CPU hist if GPU params not supported
+                params.update(dict(tree_method="hist"))
+                params.pop("predictor", None)
+                params.pop("gpu_id", None)
+                return XGBRegressor(**params)
         except Exception as e:
             raise RuntimeError(
                 "xgboost is not installed. Install with `uv add xgboost` or use --model hgb/rf."
@@ -334,7 +344,7 @@ def get_model(kind: str, seed: int):
         try:
             import lightgbm as lgb
 
-            return lgb.LGBMRegressor(
+            base_params = dict(
                 n_estimators=3000,
                 learning_rate=0.05,
                 num_leaves=31,
@@ -343,6 +353,17 @@ def get_model(kind: str, seed: int):
                 reg_lambda=1.0,
                 random_state=seed,
             )
+            if use_gpu:
+                # Try different aliases depending on LightGBM build
+                for gpu_kw in (dict(device="gpu"), dict(device_type="gpu")):
+                    try:
+                        return lgb.LGBMRegressor(**base_params, **gpu_kw)
+                    except Exception:
+                        continue
+                # Fallback to CPU if GPU not available
+                return lgb.LGBMRegressor(**base_params)
+            else:
+                return lgb.LGBMRegressor(**base_params)
         except Exception as e:
             raise RuntimeError(
                 "lightgbm is not installed. Install with `uv add lightgbm` or use --model hgb/rf."
@@ -372,6 +393,9 @@ def main():
     parser.add_argument("--remove_outliers", action="store_true")
     parser.add_argument("--no_remove_outliers", dest="remove_outliers", action="store_false")
     parser.set_defaults(remove_outliers=True)
+    parser.add_argument("--tune", action="store_true", help="Use RandomizedSearchCV to tune model hyperparameters")
+    parser.add_argument("--n_iter", type=int, default=40, help="Number of RandomizedSearchCV iterations when --tune is enabled")
+    parser.add_argument("--gpu", action="store_true", help="Enable GPU for XGBoost/LightGBM when available; safe fallback to CPU.")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -408,43 +432,109 @@ def main():
     train_numeric = X_df.select_dtypes(include=[np.number]).columns.tolist()
     X_df, X_test_df = skew_log1p_transform(X_df, X_test_df, train_numeric, threshold=0.75)
 
-    # Build preprocessor (impute + OHE) and KFold CV
+    # Build preprocessor (impute + OHE)
     pre, num_cols, cat_cols = build_preprocessor(X_df)
 
-    kf = KFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
-    oof = np.zeros(X_df.shape[0], dtype=np.float64)
-    scores: List[float] = []
+    if args.tune:
+        print("Running RandomizedSearchCV for hyperparameter tuning...")
+        base_model = get_model(args.model, args.seed, use_gpu=args.gpu)
+        pipe = Pipeline(steps=[("pre", pre), ("model", base_model)])
+        kf = KFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
 
-    X_np = None  # Keep as DataFrame; preprocessing done inside folds
+        # Param distributions per model
+        if args.model == "hgb":
+            param_dist = {
+                "model__learning_rate": [0.02, 0.03, 0.05, 0.08, 0.1, 0.15, 0.2],
+                "model__max_leaf_nodes": [15, 31, 63, 127],
+                "model__min_samples_leaf": [5, 10, 15, 20, 30, 50],
+                "model__l2_regularization": [0.0, 0.1, 0.3, 0.5, 1.0],
+                "model__max_depth": [None, 6, 8, 12],
+            }
+            scoring = "neg_mean_squared_error"  # in log space
+        elif args.model == "rf":
+            param_dist = {
+                "model__n_estimators": [300, 600, 900, 1200, 1500],
+                "model__max_depth": [None, 10, 12, 16, 20],
+                "model__max_features": ["sqrt", 0.5, 0.7, 0.9],
+                "model__min_samples_leaf": [1, 2, 4, 8],
+            }
+            scoring = "neg_mean_squared_error"
+        elif args.model == "xgb":
+            # Only if xgboost is installed
+            param_dist = {
+                "model__n_estimators": [600, 1000, 1500, 2000],
+                "model__learning_rate": [0.02, 0.03, 0.05, 0.1],
+                "model__max_depth": [4, 6, 8, 10],
+                "model__subsample": [0.6, 0.8, 1.0],
+                "model__colsample_bytree": [0.6, 0.8, 1.0],
+                "model__reg_lambda": [0.5, 1.0, 1.5],
+            }
+            scoring = "neg_mean_squared_error"
+        else:  # lgbm
+            param_dist = {
+                "model__n_estimators": [1000, 2000, 3000, 4000],
+                "model__learning_rate": [0.02, 0.03, 0.05, 0.1],
+                "model__num_leaves": [15, 31, 63, 127],
+                "model__subsample": [0.6, 0.8, 1.0],
+                "model__colsample_bytree": [0.6, 0.8, 1.0],
+                "model__reg_lambda": [0.5, 1.0, 1.5],
+            }
+            scoring = "neg_mean_squared_error"
 
-    for fold, (tr_idx, va_idx) in enumerate(kf.split(X_df), start=1):
-        X_tr = X_df.iloc[tr_idx]
-        y_tr = y[tr_idx]
-        X_va = X_df.iloc[va_idx]
-        y_va = y[va_idx]
+        search = RandomizedSearchCV(
+            estimator=pipe,
+            param_distributions=param_dist,
+            n_iter=int(args.n_iter),
+            scoring=scoring,
+            cv=kf,
+            n_jobs=-1,
+            verbose=1,
+            random_state=args.seed,
+        )
+        search.fit(X_df, y)
+        best_rmse_log = float(np.sqrt(-search.best_score_))
+        print(f"Best CV RMSE(log): {best_rmse_log:.6f}")
+        print(f"Best params: {search.best_params_}")
 
-        pipe = Pipeline(steps=[("pre", pre), ("model", get_model(args.model, args.seed))])
-        pipe.fit(X_tr, y_tr)
+        final_pipe = search.best_estimator_
+        final_pipe.fit(X_df, y)
+        test_pred_log = final_pipe.predict(X_test_df)
+        preds = np.expm1(test_pred_log) if args.log_target else test_pred_log
+    else:
+        # KFold CV with fixed hyperparameters to report score
+        kf = KFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
+        oof = np.zeros(X_df.shape[0], dtype=np.float64)
+        scores: List[float] = []
 
-        pred_va = pipe.predict(X_va)
-        oof[va_idx] = pred_va
-        score = rmsle_from_log(y_va, pred_va) if args.log_target else rmsle_from_log(np.log1p(np.expm1(y_va)), np.log1p(np.expm1(pred_va)))
-        scores.append(score)
-        print(f"Fold {fold}: RMSE(log)={score:.6f}")
+        for fold, (tr_idx, va_idx) in enumerate(kf.split(X_df), start=1):
+            X_tr = X_df.iloc[tr_idx]
+            y_tr = y[tr_idx]
+            X_va = X_df.iloc[va_idx]
+            y_va = y[va_idx]
 
-    cv_score = float(np.mean(scores))
-    print(f"CV mean RMSE(log): {cv_score:.6f}")
+            pipe = Pipeline(steps=[("pre", pre), ("model", get_model(args.model, args.seed, use_gpu=args.gpu))])
+            pipe.fit(X_tr, y_tr)
 
-    # Fit on full data and predict test
-    final_pipe = Pipeline(steps=[("pre", pre), ("model", get_model(args.model, args.seed))])
-    final_pipe.fit(X_df, y)
-    test_pred_log = final_pipe.predict(X_test_df)
-    preds = np.expm1(test_pred_log) if args.log_target else test_pred_log
+            pred_va = pipe.predict(X_va)
+            oof[va_idx] = pred_va
+            score = rmsle_from_log(y_va, pred_va) if args.log_target else rmsle_from_log(np.log1p(np.expm1(y_va)), np.log1p(np.expm1(pred_va)))
+            scores.append(score)
+            print(f"Fold {fold}: RMSE(log)={score:.6f}")
+
+        cv_score = float(np.mean(scores))
+        print(f"CV mean RMSE(log): {cv_score:.6f}")
+
+        # Fit on full data and predict test
+        final_pipe = Pipeline(steps=[("pre", pre), ("model", get_model(args.model, args.seed))])
+        final_pipe.fit(X_df, y)
+        test_pred_log = final_pipe.predict(X_test_df)
+        preds = np.expm1(test_pred_log) if args.log_target else test_pred_log
 
     sub = pd.DataFrame({"Id": df_test["Id"], "SalePrice": preds})
     out_dir = Path("submissions")
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"submission_tree_{args.model}.csv"
+    suffix = "_tuned" if args.tune else ""
+    out_path = out_dir / f"submission_tree_{args.model}{suffix}.csv"
     sub.to_csv(out_path, index=False)
     print(f"Saved submission to {out_path}")
 

@@ -8,6 +8,7 @@ dependencies = [
   "pandas",
   "scikit-learn",
   "torch",
+  "xgboost",
 ]
 
 # Not building a package here; this file exists to let `uv sync`
