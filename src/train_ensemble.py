@@ -349,12 +349,40 @@ def train_stacking_ensemble(X, y, X_test, n_folds=5, use_gpu=False):
     return final_test, cv_score
 
 
+def _augment_with_ames(train_df: pd.DataFrame, ames_path: Path) -> pd.DataFrame:
+    """Optionally augment training data with AmesHousing.csv.
+
+    - Keeps union of columns (outer concat); missing values are handled later by pipelines.
+    - Requires 'SalePrice' to be present in the Ames dataset rows.
+    """
+    try:
+        if not ames_path.exists():
+            print(f"Ames dataset not found at {ames_path}; skipping augmentation.")
+            return train_df
+        ames_df = pd.read_csv(ames_path)
+        if 'SalePrice' not in ames_df.columns:
+            print("Ames dataset missing 'SalePrice'; skipping augmentation.")
+            return train_df
+        before = len(train_df)
+        ames_df = ames_df.copy()
+        # Keep only rows with target
+        ames_df = ames_df[~ames_df['SalePrice'].isna()]
+        combined = pd.concat([train_df, ames_df], axis=0, ignore_index=True, sort=False)
+        print(f"Augmented training data with AmesHousing: +{len(combined) - before} rows (total {len(combined)}).")
+        return combined
+    except Exception as e:
+        print(f"Failed to augment with AmesHousing: {e}")
+        return train_df
+
+
 def main():
     parser = argparse.ArgumentParser(description='House Prices - Stacking Ensemble')
     parser.add_argument('--data_dir', type=str, default='data')
     parser.add_argument('--folds', type=int, default=5)
     parser.add_argument('--gpu', action='store_true', help='Enable GPU acceleration')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--include-ames', action='store_true', help='Include data from AmesHousing.csv into training')
+    parser.add_argument('--ames-path', type=str, default=None, help='Path to AmesHousing.csv (defaults to <data_dir>/AmesHousing.csv)')
     args = parser.parse_args()
     
     set_seed(args.seed)
@@ -364,10 +392,15 @@ def main():
     train_df = pd.read_csv(data_dir / 'train.csv')
     test_df = pd.read_csv(data_dir / 'test.csv')
     test_ids = test_df['Id'].values
-    
+
     # Drop Id column
     train_df = train_df.drop(columns=['Id'])
     test_df = test_df.drop(columns=['Id'])
+    
+    # Optionally augment training data with AmesHousing
+    if args.include_ames:
+        ames_path = Path(args.ames_path) if args.ames_path else (data_dir / 'AmesHousing.csv')
+        train_df = _augment_with_ames(train_df, ames_path)
     
     # Prepare data
     print("Preparing data with feature engineering...")

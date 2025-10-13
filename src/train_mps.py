@@ -55,6 +55,29 @@ class TabularDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
+def _augment_with_ames(train_df: pd.DataFrame, ames_path: Path) -> pd.DataFrame:
+    """Optionally augment training data with AmesHousing.csv.
+
+    Uses outer concat and relies on downstream preprocessing to handle missing values.
+    """
+    try:
+        if not ames_path.exists():
+            print(f"Ames dataset not found at {ames_path}; skipping augmentation.")
+            return train_df
+        ames_df = pd.read_csv(ames_path)
+        if 'SalePrice' not in ames_df.columns:
+            print("Ames dataset missing 'SalePrice'; skipping augmentation.")
+            return train_df
+        before = len(train_df)
+        ames_df = ames_df[~ames_df['SalePrice'].isna()].copy()
+        combined = pd.concat([train_df, ames_df], axis=0, ignore_index=True, sort=False)
+        print(f"Augmented training data with AmesHousing: +{len(combined) - before} rows (total {len(combined)}).")
+        return combined
+    except Exception as e:
+        print(f"Failed to augment with AmesHousing: {e}")
+        return train_df
+
+
 class MLP(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int = 256, layers: int = 3, dropout: float = 0.0):
         super().__init__()
@@ -229,6 +252,8 @@ def main():
         action="store_true",
         help="Preload full tensors to device memory (set num_workers=0 automatically). Suitable for small tabular data.",
     )
+    parser.add_argument("--include-ames", action="store_true", help="Include data from AmesHousing.csv into training")
+    parser.add_argument("--ames-path", type=str, default=None, help="Path to AmesHousing.csv (defaults to <data_dir>/AmesHousing.csv)")
     parser.set_defaults(log_target=True)
     parser.set_defaults(amp=True)
     args = parser.parse_args()
@@ -249,6 +274,11 @@ def main():
 
     df_train = pd.read_csv(train_path)
     df_test = pd.read_csv(test_path)
+
+    # Optionally augment training data
+    if args.include_ames:
+        ames_path = Path(args.ames_path) if args.ames_path else (data_dir / 'AmesHousing.csv')
+        df_train = _augment_with_ames(df_train, ames_path)
 
     target_col = "SalePrice"
     y = df_train[target_col].values.astype(np.float32)

@@ -111,6 +111,9 @@ uv sync                                # 同步依赖（基于 pyproject.toml）
 ```bash
 # 深度神经网络 + XGBoost + LightGBM 三模型 stacking
 uv run python src/train_gpu_ensemble.py --folds 5
+
+# 训练集额外并入 AmesHousing.csv（可选）
+uv run python src/train_gpu_ensemble.py --folds 5 --include-ames --ames-path data/AmesHousing.csv
 ```
 
 **特点**：
@@ -128,6 +131,9 @@ uv run python src/train_gpu_ensemble.py --folds 5
 # XGBoost（GPU加速 + 超参数搜索）
 uv run python src/train_tree.py --model xgb --gpu --folds 5
 
+# 训练集额外并入 AmesHousing.csv（可选）
+uv run python src/train_tree.py --model xgb --gpu --folds 5 --include-ames --ames-path data/AmesHousing.csv
+
 # 带超参数搜索（20次迭代）
 uv run python src/train_tree.py --model xgb --tune --n_iter 20 --folds 3 --gpu
 
@@ -144,6 +150,8 @@ uv run python src/train_tree.py --model hgb --folds 5
 - `--tune`: 超参数搜索（RandomizedSearchCV）
 - `--n_iter`: 搜索迭代次数（默认40）
 - `--folds`: K折交叉验证折数（默认5）
+- `--include-ames`: 训练集并入 `AmesHousing.csv`
+- `--ames-path`: 指定 AmesHousing 数据路径（默认 `data/AmesHousing.csv`）
 
 ---
 
@@ -156,6 +164,9 @@ uv run python src/train_mps.py --device mps --epochs 200 --batch_size 512
 
 # CUDA GPU
 uv run python src/train_mps.py --device cuda --epochs 300 --batch_size 1024
+
+# 训练集额外并入 AmesHousing.csv（可选）
+uv run python src/train_mps.py --device mps --include-ames --ames-path data/AmesHousing.csv
 ```
 
 ---
