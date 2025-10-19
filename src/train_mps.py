@@ -412,8 +412,8 @@ def main():
             model.eval()
             fold_pred = []
             with torch.no_grad():
-            for Xb in test_loader:
-                Xb = Xb.to(device, non_blocking=(device.type == "cuda"))
+                for Xb in test_loader:
+                    Xb = Xb.to(device, non_blocking=(device.type == "cuda"))
                     pb = model(Xb).squeeze(1).detach().cpu().numpy()
                     fold_pred.append(pb)
             fold_pred = np.concatenate(fold_pred, axis=0)

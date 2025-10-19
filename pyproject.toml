@@ -6,6 +6,7 @@ requires-python = ">=3.10"
 dependencies = [
   "lightgbm>=4.6.0",
   "numpy",
+  "optuna>=4.1.0",
   "pandas",
   "scikit-learn",
   "torch",

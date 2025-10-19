@@ -1,4 +1,6 @@
 submissions/
+实验报告.md
+optuna_study.db
 
 # Python cache
 __pycache__/

@@ -350,25 +350,109 @@ def train_stacking_ensemble(X, y, X_test, n_folds=5, use_gpu=False):
 
 
 def _augment_with_ames(train_df: pd.DataFrame, ames_path: Path) -> pd.DataFrame:
-    """Optionally augment training data with AmesHousing.csv.
+    """Augment training data with AmesHousing.csv after normalizing its schema.
 
-    - Keeps union of columns (outer concat); missing values are handled later by pipelines.
-    - Requires 'SalePrice' to be present in the Ames dataset rows.
+    - Renames Ames columns to Kaggle naming (remove spaces, unify names)
+    - Converts 'NA' strings to NaN and coerces numeric dtypes to match train_df
+    - Keeps only columns that exist in train_df (plus SalePrice) to avoid schema drift
     """
     try:
         if not ames_path.exists():
             print(f"Ames dataset not found at {ames_path}; skipping augmentation.")
             return train_df
+
         ames_df = pd.read_csv(ames_path)
         if 'SalePrice' not in ames_df.columns:
             print("Ames dataset missing 'SalePrice'; skipping augmentation.")
             return train_df
+
+        rename_map = {
+            "MS SubClass": "MSSubClass",
+            "MS Zoning": "MSZoning",
+            "Lot Frontage": "LotFrontage",
+            "Lot Area": "LotArea",
+            "Lot Shape": "LotShape",
+            "Land Contour": "LandContour",
+            "Lot Config": "LotConfig",
+            "Land Slope": "LandSlope",
+            "Condition 1": "Condition1",
+            "Condition 2": "Condition2",
+            "Bldg Type": "BldgType",
+            "House Style": "HouseStyle",
+            "Overall Qual": "OverallQual",
+            "Overall Cond": "OverallCond",
+            "Year Built": "YearBuilt",
+            "Year Remod/Add": "YearRemodAdd",
+            "Roof Style": "RoofStyle",
+            "Roof Matl": "RoofMatl",
+            "Exterior 1st": "Exterior1st",
+            "Exterior 2nd": "Exterior2nd",
+            "Mas Vnr Type": "MasVnrType",
+            "Mas Vnr Area": "MasVnrArea",
+            "Exter Qual": "ExterQual",
+            "Exter Cond": "ExterCond",
+            "Bsmt Qual": "BsmtQual",
+            "Bsmt Cond": "BsmtCond",
+            "Bsmt Exposure": "BsmtExposure",
+            "BsmtFin Type 1": "BsmtFinType1",
+            "BsmtFin SF 1": "BsmtFinSF1",
+            "BsmtFin Type 2": "BsmtFinType2",
+            "BsmtFin SF 2": "BsmtFinSF2",
+            "Bsmt Unf SF": "BsmtUnfSF",
+            "Total Bsmt SF": "TotalBsmtSF",
+            "Heating QC": "HeatingQC",
+            "Central Air": "CentralAir",
+            "1st Flr SF": "1stFlrSF",
+            "2nd Flr SF": "2ndFlrSF",
+            "Low Qual Fin SF": "LowQualFinSF",
+            "Gr Liv Area": "GrLivArea",
+            "Bsmt Full Bath": "BsmtFullBath",
+            "Bsmt Half Bath": "BsmtHalfBath",
+            "Full Bath": "FullBath",
+            "Half Bath": "HalfBath",
+            "Bedroom AbvGr": "BedroomAbvGr",
+            "Kitchen AbvGr": "KitchenAbvGr",
+            "Kitchen Qual": "KitchenQual",
+            "TotRms AbvGrd": "TotRmsAbvGrd",
+            "Fireplace Qu": "FireplaceQu",
+            "Garage Type": "GarageType",
+            "Garage Yr Blt": "GarageYrBlt",
+            "Garage Finish": "GarageFinish",
+            "Garage Cars": "GarageCars",
+            "Garage Area": "GarageArea",
+            "Garage Qual": "GarageQual",
+            "Garage Cond": "GarageCond",
+            "Paved Drive": "PavedDrive",
+            "Wood Deck SF": "WoodDeckSF",
+            "Open Porch SF": "OpenPorchSF",
+            "Enclosed Porch": "EnclosedPorch",
+            "3Ssn Porch": "3SsnPorch",
+            "Screen Porch": "ScreenPorch",
+            "Pool Area": "PoolArea",
+            "Pool QC": "PoolQC",
+            "Misc Feature": "MiscFeature",
+            "Misc Val": "MiscVal",
+            "Mo Sold": "MoSold",
+            "Yr Sold": "YrSold",
+            "Sale Type": "SaleType",
+            "Sale Condition": "SaleCondition",
+        }
+
+        ames_df = ames_df.rename(columns=rename_map)
+        ames_df = ames_df.replace("NA", np.nan)
+
+        keep_cols = [c for c in ames_df.columns if c in train_df.columns or c == "SalePrice"]
+        ames_df = ames_df.loc[:, keep_cols]
+
+        for c in ames_df.columns:
+            if c != "SalePrice" and c in train_df.columns and np.issubdtype(train_df[c].dtype, np.number):
+                ames_df[c] = pd.to_numeric(ames_df[c], errors='coerce')
+
+        ames_df = ames_df[~ames_df['SalePrice'].isna()].copy()
+
         before = len(train_df)
-        ames_df = ames_df.copy()
-        # Keep only rows with target
-        ames_df = ames_df[~ames_df['SalePrice'].isna()]
         combined = pd.concat([train_df, ames_df], axis=0, ignore_index=True, sort=False)
-        print(f"Augmented training data with AmesHousing: +{len(combined) - before} rows (total {len(combined)}).")
+        print(f"Augmented training data with AmesHousing (normalized): +{len(combined) - before} rows (total {len(combined)}).")
         return combined
     except Exception as e:
         print(f"Failed to augment with AmesHousing: {e}")

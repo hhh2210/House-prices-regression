@@ -71,7 +71,7 @@ House-prices-regression/
 
 **训练加速**：
 - XGBoost: `device='cuda'`, `tree_method='hist'`
-- LightGBM: `device='gpu'`（需 GPU 版本）
+- LightGBM: `device='gpu'`（should be careful with OpenCL for GPU）
 - PyTorch: CUDA张量 + DataLoader批处理
 - Early stopping：避免过拟合并节省时间
 
@@ -80,13 +80,6 @@ House-prices-regression/
 - 神经网络支持混合精度训练（AMP）
 - 5折交叉验证并行处理
 
-### 4. 性能指标
-
-| 模型 | CV Score (RMSE log) | 特点 |
-|------|---------------------|------|
-| XGBoost Tuned | ~0.116 | GPU加速，超参数搜索 |
-| GPU Ensemble (NN+XGBoost+LGB) | **~0.121** | 完整stacking，最佳性能 |
-| HGB Tuned | ~0.120 | CPU友好 |
 
 ## 快速开始
 
@@ -231,15 +224,6 @@ uv run python src/train_mps.py --device mps --include-ames --ames-path data/Ames
    - 增加搜索空间和迭代次数
    - 针对ensemble权重的grid search
 
-## 注意事项
-
-- **数据路径**：确保 `data/train.csv` 和 `data/test.csv` 存在
-- **GPU显存**：神经网络batch size根据显存调整（48GB可用4096+）
-- **训练时间**：
-  - GPU Ensemble: ~5-10分钟 (L20 48GB)
-  - Tree模型单次: ~1-2分钟
-  - Tree模型调参: 取决于`n_iter`，建议20-50次
-- **CV vs Kaggle分数**：通常CV分数比Public LB略高0.001-0.003
 
 ## 项目依赖
 
